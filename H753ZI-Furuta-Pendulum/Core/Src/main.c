@@ -462,20 +462,22 @@ static void MX_GPIO_Init(void)
 /* USER CODE BEGIN 4 */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-	 /*
     if(htim->Instance == TIM2)
     {
         tick_1k++;
 
+        // Print every 1000 interrupts to prove 1kHz operation
         if((tick_1k % 1000) == 0)
         {
-            printf("1 second\r\n");
+            printf("TIM2 @1kHz: tick_1k = %lu (1 second elapsed)\r\n", tick_1k);
         }
-    }
-    */
-
-    if(htim->Instance == TIM2)
-    {
+        
+        // Optional: Print every 100 interrupts for faster feedback
+        if((tick_1k % 100) == 0)
+        {
+            printf("  -> 100ms: tick_1k = %lu\r\n", tick_1k);
+        }
+        
         HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_4);
     }
 }
