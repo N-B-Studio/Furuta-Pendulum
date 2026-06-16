@@ -21,7 +21,6 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -31,7 +30,12 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define AS5047P_CS_PORT GPIOA
+#define AS5047P_CS_PIN  GPIO_PIN_4
 
+#define AS5047P_REG_ANGLECOM 0x3FFF
+#define AS5047P_CPR          16384.0f
+#define TWO_PI_F             6.28318530718f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -53,7 +57,11 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart4;
 
 /* USER CODE BEGIN PV */
-volatile uint32_t tick_1k = 0;
+volatile uint32_t tick_1k = 0; // 1kHz timer tick count
+volatile uint8_t control_tick = 0;
+
+uint16_t as5047_raw = 0;
+float as5047_angle_rad = 0.0f;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -69,7 +77,51 @@ static void MX_UART4_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+static uint8_t even_parity_16(uint16_t v)
+{
+    v ^= v >> 8;
+    v ^= v >> 4;
+    v ^= v >> 2;
+    v ^= v >> 1;
+    return v & 1;
+}
 
+static uint16_t as5047p_make_read_cmd(uint16_t addr)
+{
+    uint16_t cmd = 0x4000 | (addr & 0x3FFF);  // bit14 = read
+    if (even_parity_16(cmd))
+    {
+        cmd |= 0x8000; // bit15 parity
+    }
+    return cmd;
+}
+
+static uint16_t as5047p_spi_txrx(uint16_t tx)
+{
+    uint16_t rx = 0;
+
+    HAL_GPIO_WritePin(AS5047P_CS_PORT, AS5047P_CS_PIN, GPIO_PIN_RESET);
+    HAL_SPI_TransmitReceive(&hspi1, (uint8_t*)&tx, (uint8_t*)&rx, 1, HAL_MAX_DELAY);
+    HAL_GPIO_WritePin(AS5047P_CS_PORT, AS5047P_CS_PIN, GPIO_PIN_SET);
+
+    return rx;
+}
+
+static uint16_t as5047p_read_angle_raw(void)
+{
+    uint16_t cmd = as5047p_make_read_cmd(AS5047P_REG_ANGLECOM);
+
+    as5047p_spi_txrx(cmd);
+    for(volatile int i=0;i<50;i++);
+    uint16_t rx = as5047p_spi_txrx(0x0000);
+
+    return rx & 0x3FFF;
+}
+
+static float as5047p_raw_to_rad(uint16_t raw)
+{
+    return ((float)raw / AS5047P_CPR) * TWO_PI_F;
+}
 /* USER CODE END 0 */
 
 /**
@@ -108,7 +160,6 @@ int main(void)
   /* USER CODE BEGIN 2 */
   HAL_TIM_Base_Start_IT(&htim2);
 
-  printf("TIM2 1kHz started\r\n");
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -129,14 +180,6 @@ int main(void)
   {
     Error_Handler();
   }
-
-  printf("\r\n");
-  printf("SYSCLK=%lu\r\n", HAL_RCC_GetSysClockFreq());
-  printf("HCLK=%lu\r\n", HAL_RCC_GetHCLKFreq());
-  printf("PCLK1=%lu\r\n", HAL_RCC_GetPCLK1Freq());
-  printf("PCLK2=%lu\r\n", HAL_RCC_GetPCLK2Freq());
-
-  printf("CLOCK CONFIG!\r\n");
 
   /* USER CODE BEGIN BSP */
 
@@ -170,6 +213,20 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+
+    if (control_tick)
+    {
+        control_tick = 0;
+
+        as5047_raw = as5047p_read_angle_raw();
+        as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
+
+        if ((tick_1k % 10) == 0)   // 100Hz print
+        {
+        	printf("raw=%u\r\n", as5047_raw);
+            //printf("raw=%u angle=%.4f rad\r\n", as5047_raw, as5047_angle_rad);
+        }
+    }
   }
   /* USER CODE END 3 */
 }
@@ -443,6 +500,7 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
@@ -451,7 +509,7 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pin = GPIO_PIN_4;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
@@ -465,20 +523,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     if(htim->Instance == TIM2)
     {
         tick_1k++;
-
-        // Print every 1000 interrupts to prove 1kHz operation
-        if((tick_1k % 1000) == 0)
-        {
-            printf("TIM2 @1kHz: tick_1k = %lu (1 second elapsed)\r\n", tick_1k);
-        }
-        
-        // Optional: Print every 100 interrupts for faster feedback
-        if((tick_1k % 100) == 0)
-        {
-            printf("  -> 100ms: tick_1k = %lu\r\n", tick_1k);
-        }
-        
-        HAL_GPIO_TogglePin(GPIOA, GPIO_PIN_4);
+        control_tick = 1;
     }
 }
 /* USER CODE END 4 */
