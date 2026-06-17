@@ -30,12 +30,32 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define AS5047P_CS_PORT GPIOA
-#define AS5047P_CS_PIN  GPIO_PIN_4
+
+// AS5047P SPI
+#define AS5047P_CS_PORT GPIOD
+#define AS5047P_CS_PIN  GPIO_PIN_14
 
 #define AS5047P_REG_ANGLECOM 0x3FFF
 #define AS5047P_CPR          16384.0f
 #define TWO_PI_F             6.28318530718f
+
+// CAN IDs and commands
+#define ODRIVE_NODE_ID              1
+
+#define ODRIVE_CMD_HEARTBEAT        0x01
+#define ODRIVE_CMD_SET_AXIS_STATE   0x07
+#define ODRIVE_CMD_GET_ENCODER_EST  0x09
+#define ODRIVE_CMD_SET_CTRL_MODE    0x0B
+#define ODRIVE_CMD_SET_INPUT_TORQUE 0x0E
+
+#define AXIS_STATE_IDLE             1
+#define AXIS_STATE_CLOSED_LOOP      8
+
+#define CONTROL_MODE_TORQUE         1
+#define INPUT_MODE_PASSTHROUGH      1
+
+#define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -57,11 +77,26 @@ TIM_HandleTypeDef htim2;
 UART_HandleTypeDef huart4;
 
 /* USER CODE BEGIN PV */
-volatile uint32_t tick_1k = 0; // 1kHz timer tick count
+
+// 1kHz timer tick count
+volatile uint32_t tick_1k = 0;
 volatile uint8_t control_tick = 0;
 
+// AS5047P encoder
 uint16_t as5047_raw = 0;
 float as5047_angle_rad = 0.0f;
+
+// ODrive CAN communication
+volatile uint8_t odrive_rx_flag = 0;
+
+float odrive_pos_turns = 0.0f;
+float odrive_vel_turns_s = 0.0f;
+
+uint32_t odrive_axis_error = 0;
+uint8_t odrive_axis_state = 0;
+uint8_t odrive_system_error = 0;
+
+
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -77,6 +112,8 @@ static void MX_UART4_Init(void);
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+
+// AS5047P SPI communication
 static uint8_t even_parity_16(uint16_t v)
 {
     v ^= v >> 8;
@@ -122,6 +159,158 @@ static float as5047p_raw_to_rad(uint16_t raw)
 {
     return ((float)raw / AS5047P_CPR) * TWO_PI_F;
 }
+
+// ODrive CAN communication
+static void pack_u32(uint8_t *buf, uint32_t v)
+{
+    buf[0] = (uint8_t)(v >> 0);
+    buf[1] = (uint8_t)(v >> 8);
+    buf[2] = (uint8_t)(v >> 16);
+    buf[3] = (uint8_t)(v >> 24);
+}
+
+static void pack_float(uint8_t *buf, float v)
+{
+    union {
+        float f;
+        uint8_t b[4];
+    } u;
+
+    u.f = v;
+    buf[0] = u.b[0];
+    buf[1] = u.b[1];
+    buf[2] = u.b[2];
+    buf[3] = u.b[3];
+}
+
+static float unpack_float(const uint8_t *buf)
+{
+    union {
+        float f;
+        uint8_t b[4];
+    } u;
+
+    u.b[0] = buf[0];
+    u.b[1] = buf[1];
+    u.b[2] = buf[2];
+    u.b[3] = buf[3];
+
+    return u.f;
+}
+
+static uint32_t unpack_u32(const uint8_t *buf)
+{
+    return ((uint32_t)buf[0] << 0)  |
+           ((uint32_t)buf[1] << 8)  |
+           ((uint32_t)buf[2] << 16) |
+           ((uint32_t)buf[3] << 24);
+}
+
+static HAL_StatusTypeDef odrive_can_send(uint8_t cmd_id, uint8_t *data, uint32_t dlc)
+{
+    FDCAN_TxHeaderTypeDef txHeader = {0};
+
+    txHeader.Identifier = ODRIVE_CAN_ID(cmd_id);
+    txHeader.IdType = FDCAN_STANDARD_ID;
+    txHeader.TxFrameType = FDCAN_DATA_FRAME;
+    txHeader.DataLength = dlc;
+    txHeader.ErrorStateIndicator = FDCAN_ESI_ACTIVE;
+    txHeader.BitRateSwitch = FDCAN_BRS_OFF;
+    txHeader.FDFormat = FDCAN_CLASSIC_CAN;
+    txHeader.TxEventFifoControl = FDCAN_NO_TX_EVENTS;
+    txHeader.MessageMarker = 0;
+
+    return HAL_FDCAN_AddMessageToTxFifoQ(&hfdcan1, &txHeader, data);
+}
+
+static void odrive_clear_errors(void)
+{
+    uint8_t data[8] = {0};
+    pack_u32(&data[0], 0);  // identify = false
+    odrive_can_send(0x18, data, FDCAN_DLC_BYTES_4);
+}
+
+static void odrive_set_axis_state(uint32_t state)
+{
+    uint8_t data[8] = {0};
+    pack_u32(&data[0], state);
+    odrive_can_send(ODRIVE_CMD_SET_AXIS_STATE, data, FDCAN_DLC_BYTES_4);
+}
+
+static void odrive_set_torque_mode(void)
+{
+    uint8_t data[8] = {0};
+
+    pack_u32(&data[0], CONTROL_MODE_TORQUE);
+    pack_u32(&data[4], INPUT_MODE_PASSTHROUGH);
+
+    odrive_can_send(ODRIVE_CMD_SET_CTRL_MODE, data, FDCAN_DLC_BYTES_8);
+}
+
+static void odrive_set_torque(float torque_nm)
+{
+    uint8_t data[8] = {0};
+
+    pack_float(&data[0], torque_nm);
+
+    odrive_can_send(ODRIVE_CMD_SET_INPUT_TORQUE, data, FDCAN_DLC_BYTES_4);
+}
+
+static void odrive_set_velocity_mode(void)
+{
+    uint8_t data[8];
+
+    pack_u32(&data[0], 2); // Velocity
+    pack_u32(&data[4], 1); // Passthrough
+
+    odrive_can_send(ODRIVE_CMD_SET_CTRL_MODE,
+                    data,
+                    FDCAN_DLC_BYTES_8);
+}
+
+#define ODRIVE_CMD_SET_INPUT_VEL 0x0D
+
+static void odrive_set_velocity(float vel_turns_s)
+{
+    uint8_t data[8] = {0};
+
+    pack_float(&data[0], vel_turns_s);
+
+    odrive_can_send(ODRIVE_CMD_SET_INPUT_VEL,
+                    data,
+                    FDCAN_DLC_BYTES_8);
+}
+
+static void fdcan_start_accept_all(void)
+{
+    FDCAN_FilterTypeDef sFilterConfig = {0};
+
+    sFilterConfig.IdType = FDCAN_STANDARD_ID;
+    sFilterConfig.FilterIndex = 0;
+    sFilterConfig.FilterType = FDCAN_FILTER_MASK;
+    sFilterConfig.FilterConfig = FDCAN_FILTER_TO_RXFIFO0;
+    sFilterConfig.FilterID1 = 0x000;
+    sFilterConfig.FilterID2 = 0x000;
+
+    if (HAL_FDCAN_ConfigFilter(&hfdcan1, &sFilterConfig) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_FDCAN_Start(&hfdcan1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
+    if (HAL_FDCAN_ActivateNotification(&hfdcan1,
+                                        FDCAN_IT_RX_FIFO0_NEW_MESSAGE,
+                                        0) != HAL_OK)
+    {
+        Error_Handler();
+    }
+}
+
+
 /* USER CODE END 0 */
 
 /**
@@ -158,6 +347,27 @@ int main(void)
   MX_TIM2_Init();
   MX_UART4_Init();
   /* USER CODE BEGIN 2 */
+
+  // Start FDCAN in normal mode, accept all messages
+  fdcan_start_accept_all();
+
+  HAL_Delay(100);
+
+  odrive_clear_errors();
+  HAL_Delay(20);
+
+  //odrive_set_torque_mode();
+  //HAL_Delay(20);
+
+  odrive_set_velocity_mode();
+  HAL_Delay(20);
+
+  odrive_set_axis_state(AXIS_STATE_CLOSED_LOOP);
+  HAL_Delay(200);
+
+  odrive_set_torque(0.0f);
+
+  // Start 1ms timer interrupt
   HAL_TIM_Base_Start_IT(&htim2);
 
   /* USER CODE END 2 */
@@ -213,20 +423,92 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
+    static uint32_t state_time = 0;
+    static uint8_t test_state = 0;
 
-    if (control_tick)
+    if(control_tick)
     {
         control_tick = 0;
 
+        // 1. SPI
         as5047_raw = as5047p_read_angle_raw();
         as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
 
-        if ((tick_1k % 10) == 0)   // 100Hz print
+        // 2.1 PID
+
+        // 2.2 LQR
+
+        // 2.3 RL policy
+
+        // 3. Odrive set torque
+        state_time++;
+
+        switch(test_state)
         {
-        	printf("raw=%u\r\n", as5047_raw);
-            //printf("raw=%u angle=%.4f rad\r\n", as5047_raw, as5047_angle_rad);
+            case 0:
+                odrive_set_velocity(+0.3f);
+                if(state_time >= 4000)
+                {
+                    state_time = 0;
+                    test_state = 1;
+                    printf("reverse\r\n");
+                }
+                break;
+
+            case 1:
+                odrive_set_velocity(-0.3f);
+                if(state_time >= 4000)
+                {
+                    state_time = 0;
+                    test_state = 2;
+                    printf("release\r\n");
+                }
+                break;
+
+            case 2:
+                odrive_set_velocity(0.2f);
+                break;
+        }
+
+
+
+        // 4. print
+        if ((tick_1k % 100) == 0)   // 10Hz print
+        {
+            printf("as5047=%u odrv_pos=%.4f odrv_vel=%.4f state=%u axis_err=%lu sys_err=%u\r\n",
+                  as5047_raw,
+                  odrive_pos_turns,
+                  odrive_vel_turns_s,
+                  odrive_axis_state,
+                  odrive_axis_error,
+                  odrive_system_error);
         }
     }
+    /*
+    if (tick_1k == 3000)
+    {
+        printf("torque +0.02\r\n");
+        odrive_set_torque(0.02f);
+    }
+
+    if (tick_1k == 4000)
+    {
+        printf("torque 0\r\n");
+        odrive_set_torque(0.0f);
+    }
+
+    if (tick_1k == 5000)
+    {
+        printf("torque -0.02\r\n");
+        odrive_set_torque(-0.02f);
+    }
+
+    if (tick_1k == 6000)
+    {
+        printf("torque 0\r\n");
+        odrive_set_torque(0.0f);
+    }
+     */
   }
   /* USER CODE END 3 */
 }
@@ -503,14 +785,14 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_4, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOD, GPIO_PIN_14, GPIO_PIN_SET);
 
-  /*Configure GPIO pin : PA4 */
-  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  /*Configure GPIO pin : PD14 */
+  GPIO_InitStruct.Pin = GPIO_PIN_14;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
-  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+  HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
 
@@ -518,12 +800,51 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+// 1ms timer interrupt callback
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if(htim->Instance == TIM2)
     {
         tick_1k++;
         control_tick = 1;
+    }
+}
+
+// FDCAN RX FIFO 0 new message callback
+void HAL_FDCAN_RxFifo0Callback(FDCAN_HandleTypeDef *hfdcan, uint32_t RxFifo0ITs)
+{
+    if (hfdcan->Instance != FDCAN1)
+        return;
+
+    if ((RxFifo0ITs & FDCAN_IT_RX_FIFO0_NEW_MESSAGE) == 0)
+        return;
+
+    FDCAN_RxHeaderTypeDef rxHeader;
+    uint8_t rxData[8];
+
+    if (HAL_FDCAN_GetRxMessage(&hfdcan1, FDCAN_RX_FIFO0, &rxHeader, rxData) != HAL_OK)
+        return;
+
+    uint16_t can_id = rxHeader.Identifier;
+    uint8_t cmd_id = can_id & 0x1F;
+    uint8_t node_id = can_id >> 5;
+
+    if (node_id != ODRIVE_NODE_ID)
+        return;
+
+    if (cmd_id == ODRIVE_CMD_HEARTBEAT)
+    {
+        odrive_axis_error = unpack_u32(&rxData[0]);
+        odrive_axis_state = rxData[4];
+        odrive_system_error = rxData[6];
+        odrive_rx_flag = 1;
+    }
+    else if (cmd_id == ODRIVE_CMD_GET_ENCODER_EST)
+    {
+        odrive_pos_turns = unpack_float(&rxData[0]);
+        odrive_vel_turns_s = unpack_float(&rxData[4]);
+        odrive_rx_flag = 1;
     }
 }
 /* USER CODE END 4 */
