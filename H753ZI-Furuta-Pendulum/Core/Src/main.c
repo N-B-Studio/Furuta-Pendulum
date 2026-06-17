@@ -39,6 +39,8 @@
 #define AS5047P_CPR          16384.0f
 #define TWO_PI_F             6.28318530718f
 
+#define UPRIGHT_RAW 16200
+
 // CAN IDs and commands
 #define ODRIVE_NODE_ID              1
 
@@ -56,6 +58,18 @@
 
 #define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
 
+// Control: PID
+#define CONTROL_DT              0.001f
+
+#define PID_KP          0.380f
+#define PID_KD          0.0005f
+#define MOTOR_DAMPING   0.0015f
+#define FRICTION_FF     0.008f
+#define TORQUE_DEADBAND 0.010f
+
+#define TORQUE_LIMIT    0.06f
+#define BALANCE_ANGLE_LIMIT 0.25f
+#define SWING_TORQUE            0.02f    // Nm
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -96,7 +110,16 @@ uint32_t odrive_axis_error = 0;
 uint8_t odrive_axis_state = 0;
 uint8_t odrive_system_error = 0;
 
+// Control variables
+//loat pend_upright_rad = 0.0f;
+float pend_theta = 0.0f;
+float pend_theta_prev = 0.0f;
+float pend_vel_rad_s = 0.0f;
 
+//uint8_t upright_calibrated = 0;
+uint8_t control_enabled = 0;   // 默认不控制，先校准
+uint8_t last_control_enabled = 0;
+float pend_upright_rad = ((float)UPRIGHT_RAW / AS5047P_CPR) * TWO_PI_F;
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -310,7 +333,42 @@ static void fdcan_start_accept_all(void)
     }
 }
 
+// Control functions
+static float wrap_pi(float x)
+{
+    while (x > 3.14159265359f)  x -= 6.28318530718f;
+    while (x < -3.14159265359f) x += 6.28318530718f;
+    return x;
+}
 
+static float clampf(float x, float min_v, float max_v)
+{
+    if (x > max_v) return max_v;
+    if (x < min_v) return min_v;
+    return x;
+}
+
+static float compute_swingup_torque(float theta, float theta_dot)
+{
+    float dir = 0.0f;
+
+    if (theta_dot > 0.02f)      dir = 1.0f;
+    else if (theta_dot < -0.02f) dir = -1.0f;
+    else                        dir = (theta > 0.0f) ? 1.0f : -1.0f;
+
+    return SWING_TORQUE * dir;
+}
+
+static float compute_balance_pid(float theta, float theta_dot, float motor_vel)
+{
+    float tau = 0.0f;
+
+    tau += -PID_KP * theta;
+    tau += -PID_KD * theta_dot;
+    tau += -MOTOR_DAMPING * motor_vel;
+
+    return clampf(-tau, -TORQUE_LIMIT, TORQUE_LIMIT);
+}
 /* USER CODE END 0 */
 
 /**
@@ -356,20 +414,25 @@ int main(void)
   odrive_clear_errors();
   HAL_Delay(20);
 
-  //odrive_set_torque_mode();
-  //HAL_Delay(20);
-
-  odrive_set_velocity_mode();
+  odrive_set_torque_mode();
   HAL_Delay(20);
 
-  odrive_set_axis_state(AXIS_STATE_CLOSED_LOOP);
-  HAL_Delay(200);
+  //odrive_set_velocity_mode();
+  //HAL_Delay(20);
+
+  odrive_set_axis_state(AXIS_STATE_IDLE);
+  HAL_Delay(100);
 
   odrive_set_torque(0.0f);
 
   // Start 1ms timer interrupt
   HAL_TIM_Base_Start_IT(&htim2);
 
+
+  // set upright position
+  control_enabled = 0;
+  pend_theta_prev = 0.0f;
+  pend_vel_rad_s = 0.0f;
   /* USER CODE END 2 */
 
   /* Initialize leds */
@@ -407,109 +470,108 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
-    /* -- Sample board code for User push-button in interrupt mode ---- */
     if (BspButtonState == BUTTON_PRESSED)
     {
-      /* Update button state */
-      BspButtonState = BUTTON_RELEASED;
-      /* -- Sample board code to toggle leds ---- */
-      BSP_LED_Toggle(LED_GREEN);
-      BSP_LED_Toggle(LED_BLUE);
-      BSP_LED_Toggle(LED_RED);
+        BspButtonState = BUTTON_RELEASED;
 
-      /* ..... Perform your action ..... */
+        control_enabled = !control_enabled;
+
+
+
+        if (control_enabled)
+        {
+            /* -- Sample board code to toggle leds ---- */
+            BSP_LED_Toggle(LED_GREEN);
+
+            pend_theta_prev = pend_theta;
+            pend_vel_rad_s = 0.0f;
+
+            odrive_clear_errors();
+            HAL_Delay(2);
+            odrive_set_torque_mode();
+            HAL_Delay(2);
+            odrive_set_axis_state(AXIS_STATE_CLOSED_LOOP);
+            HAL_Delay(20);
+            odrive_set_torque(0.0f);
+
+            printf("PID ENABLED\r\n");
+        }
+        else
+        {
+            BSP_LED_Toggle(LED_BLUE);
+            BSP_LED_Toggle(LED_RED);
+
+            odrive_set_torque(0.0f);
+            HAL_Delay(2);
+            odrive_set_axis_state(AXIS_STATE_IDLE);
+
+            printf("MOTOR RELEASED\r\n");
+        }
     }
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    static uint32_t state_time = 0;
-    static uint8_t test_state = 0;
+      if(control_tick)
+      {
+          control_tick = 0;
 
-    if(control_tick)
-    {
-        control_tick = 0;
+          as5047_raw = as5047p_read_angle_raw();
+          as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
 
-        // 1. SPI
-        as5047_raw = as5047p_read_angle_raw();
-        as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
+          pend_theta = wrap_pi(as5047_angle_rad - pend_upright_rad);
+          pend_vel_rad_s = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
+          pend_theta_prev = pend_theta;
 
-        // 2.1 PID
+          float torque_cmd = 0.0f;
 
-        // 2.2 LQR
+          if (control_enabled && odrive_axis_state == AXIS_STATE_CLOSED_LOOP)
+          {
+              if (pend_theta < BALANCE_ANGLE_LIMIT && pend_theta > -BALANCE_ANGLE_LIMIT)
+              {
+                  torque_cmd = compute_balance_pid(pend_theta, pend_vel_rad_s, odrive_vel_turns_s);
+              }
+              else
+              {
+                  torque_cmd = compute_swingup_torque(pend_theta, pend_vel_rad_s);
+                 // torque_cmd = 0.0f;   // 先不要 swing-up
+              }
 
-        // 2.3 RL policy
+              if (torque_cmd > TORQUE_DEADBAND)
+              {
+                  torque_cmd += FRICTION_FF;
+              }
+              else if (torque_cmd < -TORQUE_DEADBAND)
+              {
+                  torque_cmd -= FRICTION_FF;
+              }
+              else
+              {
+                  torque_cmd = 0.0f;
+              }
 
-        // 3. Odrive set torque
-        state_time++;
+              torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
+              odrive_set_torque(torque_cmd);
+          }
+          else
+          {
+              torque_cmd = 0.0f;
+          }
 
-        switch(test_state)
-        {
-            case 0:
-                odrive_set_velocity(+0.3f);
-                if(state_time >= 4000)
-                {
-                    state_time = 0;
-                    test_state = 1;
-                    printf("reverse\r\n");
-                }
-                break;
-
-            case 1:
-                odrive_set_velocity(-0.3f);
-                if(state_time >= 4000)
-                {
-                    state_time = 0;
-                    test_state = 2;
-                    printf("release\r\n");
-                }
-                break;
-
-            case 2:
-                odrive_set_velocity(0.2f);
-                break;
-        }
-
-
-
-        // 4. print
-        if ((tick_1k % 100) == 0)   // 10Hz print
-        {
-            printf("as5047=%u odrv_pos=%.4f odrv_vel=%.4f state=%u axis_err=%lu sys_err=%u\r\n",
-                  as5047_raw,
-                  odrive_pos_turns,
-                  odrive_vel_turns_s,
-                  odrive_axis_state,
-                  odrive_axis_error,
-                  odrive_system_error);
-        }
+          if ((tick_1k % 100) == 0)
+          {
+              printf("en=%u raw=%u theta=%.3f vel=%.3f tau=%.3f mpos=%.3f mvel=%.3f state=%u err=%lu\r\n",
+                    control_enabled,
+                    as5047_raw,
+                    pend_theta,
+                    pend_vel_rad_s,
+                    torque_cmd,
+                    odrive_pos_turns,
+                    odrive_vel_turns_s,
+                    odrive_axis_state,
+                    odrive_axis_error);
+          }
+      }
     }
-    /*
-    if (tick_1k == 3000)
-    {
-        printf("torque +0.02\r\n");
-        odrive_set_torque(0.02f);
-    }
-
-    if (tick_1k == 4000)
-    {
-        printf("torque 0\r\n");
-        odrive_set_torque(0.0f);
-    }
-
-    if (tick_1k == 5000)
-    {
-        printf("torque -0.02\r\n");
-        odrive_set_torque(-0.02f);
-    }
-
-    if (tick_1k == 6000)
-    {
-        printf("torque 0\r\n");
-        odrive_set_torque(0.0f);
-    }
-     */
-  }
   /* USER CODE END 3 */
 }
 
