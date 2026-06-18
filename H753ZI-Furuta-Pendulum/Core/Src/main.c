@@ -59,15 +59,17 @@
 #define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
 
 // Control: PID parameters
-#define PID_KP              0.500f
-#define PID_KI              0.000f
-#define PID_KD              0.000f
+#define PID_KP              0.400f
+#define PID_KI              0.0001f
+#define PID_KD              0.018f
+
+#define ARM_VEL_DAMPING     0.010f
 
 #define PID_I_LIMIT         0.03f
 #define TORQUE_LIMIT        0.10f
 
-#define BALANCE_ANGLE_LIMIT 0.35f // 0.35 -》 20°
-#define SWING_TORQUE            0.03f    // Nm
+#define BALANCE_ANGLE_LIMIT 0.55f // 0.35 -》 20°
+#define SWING_TORQUE            0.06f    // Nm
 
 #define CONTROL_DT          0.001f // 1ms control loop
 /* USER CODE END PD */
@@ -546,13 +548,28 @@ int main(void)
               if (pend_theta > -BALANCE_ANGLE_LIMIT && pend_theta < BALANCE_ANGLE_LIMIT)
               {
                   torque_cmd = compute_pid(pend_theta, pend_vel_rad_s);
+
+                  /* ODrive vel is turns/s, convert roughly to rad/s */
+                  float arm_vel_rad_s = odrive_vel_turns_s * TWO_PI_F;
+                  /* try this sign first */
+                  float damping =  clampf(ARM_VEL_DAMPING * arm_vel_rad_s, -0.04, 0.04);
+                  torque_cmd += damping;
+                  torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
               }
               else
               {
-                  torque_cmd = 0.0f;
+                  torque_cmd = compute_swingup_torque(pend_theta, pend_vel_rad_s);
                   pid_i = 0.0f;
               }
-              odrive_set_torque(torque_cmd);
+
+
+
+              torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
+
+              if ((tick_1k % 2) == 0)   // 500Hz CAN torque
+              {
+                  odrive_set_torque(torque_cmd);
+              }
           }
           else
           {
