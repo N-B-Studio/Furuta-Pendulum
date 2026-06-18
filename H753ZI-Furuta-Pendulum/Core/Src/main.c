@@ -39,7 +39,7 @@
 #define AS5047P_CPR          16384.0f
 #define TWO_PI_F             6.28318530718f
 
-#define UPRIGHT_RAW 16200
+#define UPRIGHT_RAW 14675
 
 // CAN IDs and commands
 #define ODRIVE_NODE_ID              1
@@ -59,24 +59,23 @@
 #define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
 
 // Control: PID parameters
-#define PID_KP              0.380f
-#define PID_KI              0.0001f
-#define PID_KD              0.0180f
+#define PID_KP              0.200f
+//#define PID_KI              0.000f
+#define PID_KD              0.0005f // 0.0005
 
-#define ARM_VEL_DAMPING     0.010f
+//#define PID_I_LIMIT         0.003f
+#define TORQUE_LIMIT        0.05f
 
-#define PID_I_LIMIT         0.05f
-#define TORQUE_LIMIT        0.20f
+#define BALANCE_ANGLE_LIMIT 0.35f // 20 degree
+#define SWING_TORQUE        0.018f
 
-#define BALANCE_ANGLE_LIMIT 0.45f // 0.35 -》 20°
-#define SWING_TORQUE            0.06f    // Nm
+#define CONTROL_DT          0.001f
 
-#define ARM_POS_KP          0.0015f
-#define ARM_POS_LIMIT     0.01f
-
-#define CONTROL_DT          0.001f // 1ms control loop
-#define PEND_VEL_ALPHA       0.1f   // for low-pass filtering of velocity
-
+//
+#define THETA_DEADBAND      0.010f   // ≈0.57°
+#define ARM_VEL_DAMPING     0.002f
+#define ARM_POS_KP          0.005f
+#define ARM_POS_LIMIT       0.004f
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -106,6 +105,8 @@ volatile uint8_t control_tick = 0;
 // AS5047P encoder
 uint16_t as5047_raw = 0;
 float as5047_angle_rad = 0.0f;
+static uint16_t as5047_last_good = 0;
+static uint8_t as5047_has_good = 0;
 
 // ODrive CAN communication
 volatile uint8_t odrive_rx_flag = 0;
@@ -186,6 +187,34 @@ static uint16_t as5047p_read_angle_raw(void)
     uint16_t rx = as5047p_spi_txrx(0x0000);
 
     return rx & 0x3FFF;
+}
+
+
+static uint16_t read_as5047_safe(void)
+{
+    uint16_t raw = as5047p_read_angle_raw();
+
+    if (raw == 0 || raw == 0x3FFF)
+    {
+        return as5047_has_good ? as5047_last_good : raw;
+    }
+
+    if (as5047_has_good)
+    {
+        int32_t diff = (int32_t)raw - (int32_t)as5047_last_good;
+
+        if (diff > 8192) diff -= 16384;
+        if (diff < -8192) diff += 16384;
+
+        if (diff > 300 || diff < -300)
+        {
+            return as5047_last_good;
+        }
+    }
+
+    as5047_last_good = raw;
+    as5047_has_good = 1;
+    return raw;
 }
 
 static float as5047p_raw_to_rad(uint16_t raw)
@@ -369,33 +398,14 @@ static float compute_swingup_torque(float theta, float theta_dot)
     return SWING_TORQUE * dir;
 }
 
-/*
-static float compute_balance_pid(float theta, float theta_dot, float motor_vel)
+static float compute_pd(float theta, float theta_dot)
 {
     float tau = 0.0f;
 
-    tau += -PID_KP * theta;
-    tau += -PID_KD * theta_dot;
-    tau += -MOTOR_DAMPING * motor_vel;
+    tau += PID_KP * theta;
+    tau += PID_KD * theta_dot;
 
-    return clampf(-tau, -TORQUE_LIMIT, TORQUE_LIMIT);
-}
-*/
-static float compute_pid(float theta, float theta_dot)
-{
-    float p = PID_KP * theta;
-
-    pid_i += theta * CONTROL_DT;
-    pid_i = clampf(pid_i, -PID_I_LIMIT, PID_I_LIMIT);
-    float i = PID_KI * pid_i;
-
-    float d = PID_KD * theta_dot;
-
-    float tau = p + i + d;
-
-    tau = clampf(tau, -TORQUE_LIMIT, TORQUE_LIMIT);
-
-    return tau; // reverse torque direction
+    return clampf(tau, -TORQUE_LIMIT, TORQUE_LIMIT);
 }
 /* USER CODE END 0 */
 
@@ -510,9 +520,15 @@ int main(void)
           /* -- Sample board code to toggle leds ---- */
           BSP_LED_Toggle(LED_GREEN);
           
-          arm_pos_zero = odrive_pos_turns;
+          //as5047_raw = as5047p_read_angle_raw();
+          as5047_raw = read_as5047_safe();
+          as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
+          pend_theta = wrap_pi(as5047_angle_rad - pend_upright_rad);
+
           pend_theta_prev = pend_theta;
           pend_vel_rad_s = 0.0f;
+
+          arm_pos_zero = odrive_pos_turns;
 
           odrive_clear_errors();
           HAL_Delay(20);
@@ -542,58 +558,50 @@ int main(void)
       {
           control_tick = 0;
 
-          as5047_raw = as5047p_read_angle_raw();
+          as5047_raw = read_as5047_safe();
           as5047_angle_rad = as5047p_raw_to_rad(as5047_raw);
 
           pend_theta = wrap_pi(as5047_angle_rad - pend_upright_rad);
           pend_vel_rad_s = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
           pend_theta_prev = pend_theta;
 
-          //float pend_vel_raw = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
-          //pend_vel_rad_s = pend_vel_rad_s * (1.0f - PEND_VEL_ALPHA)  + pend_vel_raw * PEND_VEL_ALPHA;
-          //pend_theta_prev = pend_theta;
-
 
           torque_cmd = 0.0f;
-          if (control_enabled ) // && odrive_axis_state == AXIS_STATE_CLOSED_LOOP
+          if (control_enabled)
           {
               if (pend_theta > -BALANCE_ANGLE_LIMIT && pend_theta < BALANCE_ANGLE_LIMIT)
               {
-                  torque_cmd = compute_pid(pend_theta, pend_vel_rad_s);
+                  float theta_ctrl = pend_theta;
 
-                  /* ODrive vel is turns/s, convert roughly to rad/s */
+                  if (theta_ctrl > -THETA_DEADBAND && theta_ctrl < THETA_DEADBAND)
+                      theta_ctrl = 0.0f;
+
+                  torque_cmd = compute_pd(theta_ctrl, pend_vel_rad_s);
+
                   float arm_vel_rad_s = odrive_vel_turns_s * TWO_PI_F;
-                  float damping =  clampf(ARM_VEL_DAMPING * arm_vel_rad_s, -0.04, 0.04);
+                  float damping = clampf(ARM_VEL_DAMPING * arm_vel_rad_s, -0.02f, 0.02f);
 
                   float arm_pos_err = odrive_pos_turns - arm_pos_zero;
                   float arm_pos_hold = clampf(ARM_POS_KP * arm_pos_err,
-                            -ARM_POS_LIMIT,
-                             ARM_POS_LIMIT);
+                                              -ARM_POS_LIMIT,
+                                              ARM_POS_LIMIT);
 
                   torque_cmd += damping;
                   torque_cmd += arm_pos_hold;
-
-                  torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
               }
               else
               {
                   torque_cmd = compute_swingup_torque(pend_theta, pend_vel_rad_s);
-                  pid_i = 0.0f;
               }
-
-
 
               torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
 
-              if ((tick_1k % 5) == 0)   // 200Hz CAN torque
-              {
+              if ((tick_1k % 5) == 0)
                   odrive_set_torque(torque_cmd);
-              }
           }
           else
           {
               torque_cmd = 0.0f;
-              pid_i = 0.0f;
           }
 
           if ((tick_1k % 100) == 0)
@@ -746,7 +754,7 @@ static void MX_SPI1_Init(void)
   hspi1.Init.CLKPolarity = SPI_POLARITY_LOW;
   hspi1.Init.CLKPhase = SPI_PHASE_2EDGE;
   hspi1.Init.NSS = SPI_NSS_SOFT;
-  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_32;
+  hspi1.Init.BaudRatePrescaler = SPI_BAUDRATEPRESCALER_256;
   hspi1.Init.FirstBit = SPI_FIRSTBIT_MSB;
   hspi1.Init.TIMode = SPI_TIMODE_DISABLE;
   hspi1.Init.CRCCalculation = SPI_CRCCALCULATION_DISABLE;
