@@ -59,19 +59,24 @@
 #define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
 
 // Control: PID parameters
-#define PID_KP              0.400f
+#define PID_KP              0.380f
 #define PID_KI              0.0001f
-#define PID_KD              0.018f
+#define PID_KD              0.0180f
 
 #define ARM_VEL_DAMPING     0.010f
 
-#define PID_I_LIMIT         0.03f
-#define TORQUE_LIMIT        0.10f
+#define PID_I_LIMIT         0.05f
+#define TORQUE_LIMIT        0.20f
 
-#define BALANCE_ANGLE_LIMIT 0.55f // 0.35 -》 20°
+#define BALANCE_ANGLE_LIMIT 0.45f // 0.35 -》 20°
 #define SWING_TORQUE            0.06f    // Nm
 
+#define ARM_POS_KP          0.0015f
+#define ARM_POS_LIMIT     0.01f
+
 #define CONTROL_DT          0.001f // 1ms control loop
+#define PEND_VEL_ALPHA       0.1f   // for low-pass filtering of velocity
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -119,6 +124,7 @@ float pend_theta_prev = 0.0f;
 float pend_vel_rad_s = 0.0f;
 float pid_i = 0.0f;
 float torque_cmd = 0.0f;
+float arm_pos_zero = 0.0f;
 
 //uint8_t upright_calibrated = 0;
 uint8_t control_enabled = 0;   // 默认不控制，先校准
@@ -503,7 +509,8 @@ int main(void)
           pid_i = 0.0f;
           /* -- Sample board code to toggle leds ---- */
           BSP_LED_Toggle(LED_GREEN);
-
+          
+          arm_pos_zero = odrive_pos_turns;
           pend_theta_prev = pend_theta;
           pend_vel_rad_s = 0.0f;
 
@@ -542,6 +549,11 @@ int main(void)
           pend_vel_rad_s = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
           pend_theta_prev = pend_theta;
 
+          //float pend_vel_raw = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
+          //pend_vel_rad_s = pend_vel_rad_s * (1.0f - PEND_VEL_ALPHA)  + pend_vel_raw * PEND_VEL_ALPHA;
+          //pend_theta_prev = pend_theta;
+
+
           torque_cmd = 0.0f;
           if (control_enabled ) // && odrive_axis_state == AXIS_STATE_CLOSED_LOOP
           {
@@ -551,9 +563,16 @@ int main(void)
 
                   /* ODrive vel is turns/s, convert roughly to rad/s */
                   float arm_vel_rad_s = odrive_vel_turns_s * TWO_PI_F;
-                  /* try this sign first */
                   float damping =  clampf(ARM_VEL_DAMPING * arm_vel_rad_s, -0.04, 0.04);
+
+                  float arm_pos_err = odrive_pos_turns - arm_pos_zero;
+                  float arm_pos_hold = clampf(ARM_POS_KP * arm_pos_err,
+                            -ARM_POS_LIMIT,
+                             ARM_POS_LIMIT);
+
                   torque_cmd += damping;
+                  torque_cmd += arm_pos_hold;
+
                   torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
               }
               else
@@ -566,7 +585,7 @@ int main(void)
 
               torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
 
-              if ((tick_1k % 2) == 0)   // 500Hz CAN torque
+              if ((tick_1k % 5) == 0)   // 200Hz CAN torque
               {
                   odrive_set_torque(torque_cmd);
               }
