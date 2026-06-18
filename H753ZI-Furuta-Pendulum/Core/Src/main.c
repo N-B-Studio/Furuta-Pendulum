@@ -58,18 +58,18 @@
 
 #define ODRIVE_CAN_ID(cmd)          ((ODRIVE_NODE_ID << 5) | (cmd))
 
-// Control: PID
-#define CONTROL_DT              0.001f
+// Control: PID parameters
+#define PID_KP              0.500f
+#define PID_KI              0.000f
+#define PID_KD              0.000f
 
-#define PID_KP          0.380f
-#define PID_KD          0.0005f
-#define MOTOR_DAMPING   0.0015f
-#define FRICTION_FF     0.008f
-#define TORQUE_DEADBAND 0.010f
+#define PID_I_LIMIT         0.03f
+#define TORQUE_LIMIT        0.10f
 
-#define TORQUE_LIMIT    0.06f
-#define BALANCE_ANGLE_LIMIT 0.25f
-#define SWING_TORQUE            0.02f    // Nm
+#define BALANCE_ANGLE_LIMIT 0.35f // 0.35 -》 20°
+#define SWING_TORQUE            0.03f    // Nm
+
+#define CONTROL_DT          0.001f // 1ms control loop
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -115,6 +115,8 @@ uint8_t odrive_system_error = 0;
 float pend_theta = 0.0f;
 float pend_theta_prev = 0.0f;
 float pend_vel_rad_s = 0.0f;
+float pid_i = 0.0f;
+float torque_cmd = 0.0f;
 
 //uint8_t upright_calibrated = 0;
 uint8_t control_enabled = 0;   // 默认不控制，先校准
@@ -359,6 +361,7 @@ static float compute_swingup_torque(float theta, float theta_dot)
     return SWING_TORQUE * dir;
 }
 
+/*
 static float compute_balance_pid(float theta, float theta_dot, float motor_vel)
 {
     float tau = 0.0f;
@@ -368,6 +371,23 @@ static float compute_balance_pid(float theta, float theta_dot, float motor_vel)
     tau += -MOTOR_DAMPING * motor_vel;
 
     return clampf(-tau, -TORQUE_LIMIT, TORQUE_LIMIT);
+}
+*/
+static float compute_pid(float theta, float theta_dot)
+{
+    float p = PID_KP * theta;
+
+    pid_i += theta * CONTROL_DT;
+    pid_i = clampf(pid_i, -PID_I_LIMIT, PID_I_LIMIT);
+    float i = PID_KI * pid_i;
+
+    float d = PID_KD * theta_dot;
+
+    float tau = p + i + d;
+
+    tau = clampf(tau, -TORQUE_LIMIT, TORQUE_LIMIT);
+
+    return tau; // reverse torque direction
 }
 /* USER CODE END 0 */
 
@@ -476,36 +496,34 @@ int main(void)
 
         control_enabled = !control_enabled;
 
-
-
         if (control_enabled)
         {
-            /* -- Sample board code to toggle leds ---- */
-            BSP_LED_Toggle(LED_GREEN);
+          pid_i = 0.0f;
+          /* -- Sample board code to toggle leds ---- */
+          BSP_LED_Toggle(LED_GREEN);
 
-            pend_theta_prev = pend_theta;
-            pend_vel_rad_s = 0.0f;
+          pend_theta_prev = pend_theta;
+          pend_vel_rad_s = 0.0f;
 
-            odrive_clear_errors();
-            HAL_Delay(2);
-            odrive_set_torque_mode();
-            HAL_Delay(2);
-            odrive_set_axis_state(AXIS_STATE_CLOSED_LOOP);
-            HAL_Delay(20);
-            odrive_set_torque(0.0f);
+          odrive_clear_errors();
+          HAL_Delay(20);
+          odrive_set_torque_mode();
+          HAL_Delay(20);
+          odrive_set_axis_state(AXIS_STATE_CLOSED_LOOP);
+          HAL_Delay(50);
+          odrive_set_torque(0.00f);
 
-            printf("PID ENABLED\r\n");
+          printf("PID ENABLED\r\n");
         }
         else
         {
-            BSP_LED_Toggle(LED_BLUE);
-            BSP_LED_Toggle(LED_RED);
+          BSP_LED_Toggle(LED_BLUE);
+          BSP_LED_Toggle(LED_RED);
+          odrive_set_torque(0.0f);
+          HAL_Delay(20);
+          odrive_set_axis_state(AXIS_STATE_IDLE);
 
-            odrive_set_torque(0.0f);
-            HAL_Delay(2);
-            odrive_set_axis_state(AXIS_STATE_IDLE);
-
-            printf("MOTOR RELEASED\r\n");
+          printf("MOTOR RELEASED\r\n");
         }
     }
     /* USER CODE END WHILE */
@@ -522,53 +540,36 @@ int main(void)
           pend_vel_rad_s = wrap_pi(pend_theta - pend_theta_prev) / CONTROL_DT;
           pend_theta_prev = pend_theta;
 
-          float torque_cmd = 0.0f;
-
-          if (control_enabled && odrive_axis_state == AXIS_STATE_CLOSED_LOOP)
+          torque_cmd = 0.0f;
+          if (control_enabled ) // && odrive_axis_state == AXIS_STATE_CLOSED_LOOP
           {
-              if (pend_theta < BALANCE_ANGLE_LIMIT && pend_theta > -BALANCE_ANGLE_LIMIT)
+              if (pend_theta > -BALANCE_ANGLE_LIMIT && pend_theta < BALANCE_ANGLE_LIMIT)
               {
-                  torque_cmd = compute_balance_pid(pend_theta, pend_vel_rad_s, odrive_vel_turns_s);
-              }
-              else
-              {
-                  torque_cmd = compute_swingup_torque(pend_theta, pend_vel_rad_s);
-                 // torque_cmd = 0.0f;   // 先不要 swing-up
-              }
-
-              if (torque_cmd > TORQUE_DEADBAND)
-              {
-                  torque_cmd += FRICTION_FF;
-              }
-              else if (torque_cmd < -TORQUE_DEADBAND)
-              {
-                  torque_cmd -= FRICTION_FF;
+                  torque_cmd = compute_pid(pend_theta, pend_vel_rad_s);
               }
               else
               {
                   torque_cmd = 0.0f;
+                  pid_i = 0.0f;
               }
-
-              torque_cmd = clampf(torque_cmd, -TORQUE_LIMIT, TORQUE_LIMIT);
               odrive_set_torque(torque_cmd);
           }
           else
           {
               torque_cmd = 0.0f;
+              pid_i = 0.0f;
           }
 
           if ((tick_1k % 100) == 0)
           {
-              printf("en=%u raw=%u theta=%.3f vel=%.3f tau=%.3f mpos=%.3f mvel=%.3f state=%u err=%lu\r\n",
-                    control_enabled,
-                    as5047_raw,
-                    pend_theta,
-                    pend_vel_rad_s,
-                    torque_cmd,
-                    odrive_pos_turns,
-                    odrive_vel_turns_s,
-                    odrive_axis_state,
-                    odrive_axis_error);
+            printf("en=%u raw=%u theta=%.3f vel=%.3f tau=%.4f state=%u err=%lu\r\n",
+                  control_enabled,
+                  as5047_raw,
+                  pend_theta,
+                  pend_vel_rad_s,
+                  torque_cmd,
+                  odrive_axis_state,
+                  odrive_axis_error);
           }
       }
     }
